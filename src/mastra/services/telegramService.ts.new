@@ -1,0 +1,97 @@
+import axios from 'axios';
+import { pitchSmith } from '../agents/pitchsmith';
+import { handleTelegramMessageFallback } from './telegramFallback';
+
+// Telegram bot token
+const TELEGRAM_TOKEN = '7771432535:AAF0xp-kOf-Pi4jiuYwCL5K9D2oleRb9XsQ';
+// Use the direct IP address with the Host header to bypass DNS issues
+const TELEGRAM_API_IP = '149.154.167.220';
+const API_URL = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const API_URL_IP = `https://${TELEGRAM_API_IP}/bot${TELEGRAM_TOKEN}`;
+
+// Retry configuration
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY = 1000; // 1 second
+
+// Kullanıcı oturumlarını takip etmek için basit bir hafıza
+interface UserSession {
+  messages: { role: 'user' | 'assistant', content: string }[];
+  lastActivity: number;
+}
+
+const userSessions: Record<string, UserSession> = {};
+
+// Oturum temizleme (30 dakika sonra)
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 dakika
+
+// Telegram'dan gelen mesajları işleme
+export async function handleTelegramMessage(message: any): Promise<void> {
+  if (!message || !message.text) {
+    console.log('[TELEGRAM] Received message without text, ignoring');
+    return;
+  }
+
+  const chatId = message.chat.id.toString();
+  const text = message.text;
+
+  console.log(`[TELEGRAM] Received message from ${chatId}: ${text}`);
+
+  // Kullanıcı oturumunu başlat veya güncelle
+  if (!userSessions[chatId]) {
+    console.log(`[TELEGRAM] Creating new session for ${chatId}`);
+    userSessions[chatId] = {
+      messages: [],
+      lastActivity: Date.now()
+    };
+  }
+
+  // Kullanıcı mesajını oturuma ekle
+  userSessions[chatId].messages.push({ role: 'user', content: text });
+  userSessions[chatId].lastActivity = Date.now();
+
+  try {
+    // "Yazıyor..." göster
+    await sendChatAction(chatId, 'typing');
+    console.log(`[TELEGRAM] Sending typing indicator to ${chatId}`);
+
+    // PitchSmith ajanına mesajı ilet
+    console.log(`[TELEGRAM] Sending message to PitchSmith agent: ${text}`);
+    
+    let responseText;
+    try {
+      const response = await pitchSmith.generate(userSessions[chatId].messages);
+      console.log(`[TELEGRAM] Received response from PitchSmith agent: ${response.text}`);
+      responseText = response.text;
+    } catch (agentError) {
+      console.error('[TELEGRAM] Error from PitchSmith agent, using fallback:', agentError);
+      responseText = await handleTelegramMessageFallback(chatId, text);
+    }
+
+    // Ajanın cevabını oturuma ekle
+    userSessions[chatId].messages.push({ role: 'assistant', content: responseText });
+
+    // Ajanın cevabını Telegram'a gönder
+    console.log(`[TELEGRAM] Sending response to ${chatId}: ${responseText}`);
+    await sendMessage(chatId, responseText);
+
+    console.log(`[TELEGRAM] Successfully sent response to ${chatId}`);
+  } catch (error) {
+    console.error('[TELEGRAM] Error processing message:', error);
+    try {
+      // Try fallback processing if regular processing fails
+      console.log(`[TELEGRAM] Attempting fallback processing for ${chatId}`);
+      const fallbackResponse = await handleTelegramMessageFallback(chatId, text);
+      await sendMessage(chatId, fallbackResponse);
+    } catch (fallbackError) {
+      console.error('[TELEGRAM] Fallback processing also failed:', fallbackError);
+      try {
+        await sendMessage(chatId, 'Üzgünüm, bir hata oluştu. Lütfen tekrar deneyin.');
+      } catch (sendError) {
+        console.error('[TELEGRAM] Failed to send error message:', sendError);
+      }
+    }
+  }
+
+  // Eski oturumları temizle
+  cleanupSessions();
+}
